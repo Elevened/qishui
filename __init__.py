@@ -18,6 +18,7 @@
 
 import time
 import traceback
+from typing import Optional
 
 # ============== 基础模块导入 ==============
 from ascript.ios import action  # type: ignore
@@ -40,8 +41,9 @@ LOOP_INTERVAL = 3           # 每次主循环间隔（秒）
 # OCR 默认引擎（iOS 推荐 vision 或 paddle）
 OCR_ENGINE = "vision"       # "vision"(iOS16+原生) / "paddle" / "mlkit"
 
-# 这台 iPhone 的 AScript 点击通道会旋转触点，其他设备按实测关闭补偿。
-CLICK_COORDINATES_ROTATED = True
+# 当前 AScript 点击通道使用原始屏幕坐标。实测触点旋转 90° 时才开启补偿。
+CLICK_COORDINATES_ROTATED = False
+MAX_PAUSED_SWIPES = 5
 
 # 区域配置（基于屏幕百分比，适配不同分辨率）
 # 右上角"免"字按钮区域：屏幕右上 1/4
@@ -540,6 +542,15 @@ COUNTDOWN_KEYWORDS = [
    ]
 
 
+def click_ad_header_text(item, label) -> bool:
+    """点击右上角文案，处理 OCR 将文字和关闭符号合并的情况。"""
+    x = item["center_x"]
+    if item["text"].rstrip().endswith(("×", "✕", "✖", "x", "X")) and item.get("rect"):
+        left, _, right, _ = item["rect"]
+        x = left + (right - left) * 0.37
+    return safe_click(round(x), round(item["center_y"]), label)
+
+
 def check_and_click_continue_watching(rect_top, rect_mid) -> bool:
     """点击广告右上角或中间恢复弹窗中的「继续观看」。"""
     mid_label = "继续观看(中间区)"
@@ -552,30 +563,75 @@ def check_and_click_continue_watching(rect_top, rect_mid) -> bool:
     if not item:
         return False
 
-    x = item["center_x"]
-    # 关闭符号与文字合并识别时，把点击位置移回文字。
-    if item["text"].strip() != "继续观看" and item.get("rect"):
-        left, _, right, _ = item["rect"]
-        x = left + (right - left) * 0.37
-    return safe_click(round(x), round(item["center_y"]), top_label)
+    return click_ad_header_text(item, top_label)
 
 
 def find_open_reward_popup(rect):
-    """识别已经弹出的奖励对话框，并返回其中的领取按钮。"""
-    button = paddle_find_first(r"^\s*领取奖励\s*$", rect)
-    if button and paddle_find_first(r"^\s*坚持退出\s*$", rect):
-        return button
+    """从同一帧确认按钮和奖励弹窗文案，排除广告里的同名入口。"""
+    try:
+        rows = Ocr.paddleocr(rect=rect, pattern=r"^\s*(领取奖励|坚持退出|再看一个视频额外获得)\s*$") or []
+    except Exception as e:
+        log(f"  识别领奖弹窗失败: {e}")
+        return None
+
+    if not isinstance(rows, list):
+        return None
+    rows = [item for item in rows if item.get("center_x", 0) > 0 and item.get("center_y", 0) > 0]
+    max_column_offset = (rect[2] - rect[0]) * 0.18
+    for button in rows:
+        if button["text"].strip() != "领取奖励":
+            continue
+        for marker in rows:
+            text = marker["text"].strip()
+            if abs(marker["center_x"] - button["center_x"]) > max_column_offset:
+                continue
+            if ((text == "坚持退出" and marker["center_y"] > button["center_y"])
+                    or (text == "再看一个视频额外获得" and marker["center_y"] < button["center_y"])):
+                return button
     return None
 
 
-def wait_ad_countdown(timeout=30) -> bool:
+def click_top_right_close(rect, label, *, symbol_pattern=None, template=None) -> bool:
+    """在右上角关闭区域点击经识别的关闭按钮。"""
+    left, top, right, bottom = rect
+    if template:
+        try:
+            match = FindImages.find(R.img(template), rect=rect)
+            if match:
+                x, y = match["center_x"], match["center_y"]
+                if left <= x < right and top <= y < bottom:
+                    return safe_click(x, y, f"{label}(模板匹配)")
+        except Exception as e:
+            log(f"  关闭模板识别失败: {e}")
+
+    if symbol_pattern:
+        hit = paddle_find_first(symbol_pattern, rect, "关闭按钮OCR")
+        if hit:
+            x, y = hit["center_x"], hit["center_y"]
+            if left <= x < right and top <= y < bottom:
+                return safe_click(x, y, f"{label}(OCR)")
+
+    try:
+        control = Selector().label(r"^关闭(?:广告|[，,]\s*按钮)?$", mode=Selector.MODE_MATCHES).find()
+        if control:
+            frame = control.rect
+            x = round(frame.x + frame.width / 2)
+            y = round(frame.y + frame.height / 2)
+            if left <= x < right and top <= y < bottom:
+                return safe_click(x, y, f"{label}(控件)")
+    except Exception as e:
+        log(f"  关闭控件识别失败: {e}")
+    return False
+
+
+def wait_ad_countdown(timeout=30) -> Optional[bool]:
     """
     阶段四：在广告界面等待倒计时结束。
     支持两种广告类型：
       1) 视频广告：倒计时结束 → 右上角出现"领取成功" → 返回，交给 claim_reward 处理
       2) 直播间广告：无倒计时，直接进入直播间 → 右上角显示"更多直播" → 
          点击关闭按钮(×) → 关闭后右上角出现"领取成功" → 返回
-    轮询优先级：已打开的领奖弹窗 > 领取成功 > 关闭直播间 > 广告倒计时 > 恢复观看
+    返回 True 表示可以领奖，False 表示超时，None 表示已关闭上滑广告。
     """
     log("阶段四：等待广告倒计时结束（支持视频广告 & 直播间广告）")
     from ascript.ios.system import screen_size as _ss  # type: ignore
@@ -586,6 +642,9 @@ def wait_ad_countdown(timeout=30) -> bool:
     rect_countdown = [int(w * 0.58), int(h * 0.045), int(w * 0.97), int(h * 0.09)]
     rect_continue_mid = [int(w * 0.07), int(h * 0.25), int(w * 0.93), int(h * 0.68)]
     rect_reward_btn = [int(w * 0.13), int(h * 0.25), int(w * 0.87), int(h * 0.70)]
+    # 右上角叉号下方的赚金币状态。
+    rect_earning_badge = [int(w * 0.81), int(h * 0.13), int(w * 0.98), int(h * 0.31)]
+    rect_last_ad = [int(w * 0.18), int(h * 0.92), int(w * 0.85), h]
     # 直播间底部区域（检测是否为直播间广告）
     # 用户实测 [118,1691,1170,2183] @ 1284x2778 → x:9.2%~91.1%, y:60.9%~78.6%
     rect_live_room = [int(w * 0.092), int(h * 0.609), int(w * 0.911), int(h * 0.786)]
@@ -595,107 +654,107 @@ def wait_ad_countdown(timeout=30) -> bool:
     # 直播间左上角"关注"按钮区域（"更多直播"未识别时的兜底判定）
     # 用户实测 [0,139,719,296] @ 1284x2778 → x:0%~56%, y:5%~10.65%
     rect_follow = [0, int(h * 0.05), int(w * 0.56), int(h * 0.107)]
-    # 直播间右上角关闭按钮(×)区域（用 FindImages 匹配模板图）
-    # 用户实测 [795,153,1284,277] @ 1284x2778 → x:61.9%~100%, y:5.5%~10%
-    rect_close_btn = [int(w * 0.619), int(h * 0.055), w, int(h * 0.10)]
+    # 直播间右上角关闭按钮区，和左侧的广告状态文字留出距离。
+    rect_close_btn = [int(w * 0.84), int(h * 0.05), w, int(h * 0.115)]
 
     deadline = time.time() + timeout
     last_sec = -1
     checks = 0
     is_live_room_logged = False
+    last_earning_status = None
+    last_earning_swipe = 0
+    paused_swipes = 0
+    earning_exit_pending = False
+    earning_exit_sent = False
+    last_exit_attempt = 0
 
     while time.time() < deadline:
         checks += 1
+
+        last_ad = paddle_find_first(r"当前\s*[是为]\s*最后\s*[一1]\s*个广告", rect_last_ad)
+        badge = paddle_find_first(r"^\s*(已暂停|赚钱中)\s*$", rect_earning_badge)
+        status = badge["text"].strip() if badge else None
+        now = time.time()
+
+        if not earning_exit_pending:
+            if last_ad:
+                log("  底部显示最后一个广告 → 返回上一页")
+                earning_exit_pending = True
+            elif status == "已暂停" and paused_swipes >= MAX_PAUSED_SWIPES and now - last_earning_swipe >= 4:
+                log(f"  上滑 {MAX_PAUSED_SWIPES} 次后仍已暂停 → 返回上一页")
+                earning_exit_pending = True
+            if earning_exit_pending:
+                deadline = max(deadline, now + 8)
+
+        if earning_exit_pending:
+            if earning_exit_sent and not last_ad and not badge:
+                log("  已关闭上滑广告，返回上一页")
+                return None
+            if (last_ad or badge) and now - last_exit_attempt >= 4:
+                last_exit_attempt = now
+                if click_top_right_close(rect_close_btn, "上滑广告关闭按钮", symbol_pattern=r"^\s*[×✕✖xX*]\s*$"):
+                    earning_exit_sent = True
+            time.sleep(0.8)
+            continue
 
         if find_open_reward_popup(rect_reward_btn):
             log("  领奖弹窗已打开 → 直接领取奖励")
             return True
 
-        # ========== 1) 最高优先：检测"领取成功"是否出现 ==========
-        # （视频广告倒计时结束，或 直播间关闭后 都会出现）
-        hit_claim = paddle_find_first(r"领取成功", rect_claim_top, "倒计时结束标志")
-        if hit_claim:
-            log(f"  检测到'领取成功'出现（轮询 {checks} 次）→ 返回，交给 claim_reward 执行两步点击")
-            return True
+        if status:
+            if status != last_earning_status:
+                log(f"  右上角赚金币状态：{status}")
+                last_earning_status = status
 
-        # ========== 2) 次高优先：检测是否在直播间内（需要关闭） ==========
+            if status == "赚钱中":
+                paused_swipes = 0
+                deadline = now + timeout
+            elif now - last_earning_swipe >= 4:
+                last_earning_swipe = now
+                x = round(w * 0.48)
+                try:
+                    action.slide(x, round(h * 0.66), x, round(h * 0.34), duration=380)
+                    paused_swipes += 1
+                    deadline = max(deadline, time.time() + 6)
+                    log(f"  赚钱已暂停 → 上滑 {paused_swipes}/{MAX_PAUSED_SWIPES} 次")
+                except Exception as e:
+                    log(f"  上滑失败: {e}")
+            time.sleep(0.8)
+            continue
+
+        last_earning_status = None
+        # 提示观看直播也计时的广告可能仍是预览，只有页面控件才用于决定是否关闭。
         # 先快速判断是否是直播间（首次发现时打印日志）
         if not is_live_room_logged:
             live_check = paddle_find_first(r"直播间", rect_live_room, "直播间检测")
             if live_check:
-                log(f"  检测到直播间广告（轮询 {checks} 次）→ 将尝试关闭直播间")
+                log(f"  检测到直播间广告（轮询 {checks} 次）")
                 is_live_room_logged = True
 
-        # 检测右上角是否有"更多直播"文字（确认在直播间内，需要关闭）
-        more_live_hit = paddle_find_first(r"更多直播", rect_more_live, "直播间识别")
-        # 兜底：未识别到"更多直播"时，检测左上角"关注"按钮确认是否仍为直播间
-        follow_hit = None
+        more_live_hit = paddle_find_first(r"^\s*更多直播\s*[>›＞]?\s*$", rect_more_live, "直播间识别")
         if not more_live_hit:
-            follow_hit = paddle_find_first(r"关注", rect_follow, "关注按钮(左上角)")
+            hit_claim = paddle_find_first(r"领取成功", rect_claim_top, "倒计时结束标志")
+            if hit_claim:
+                log(f"  检测到'领取成功'出现（轮询 {checks} 次）→ 返回，交给 claim_reward 执行两步点击")
+                return True
 
+        # 只有「关注」时，还须在右上角定位到明确的关闭控件。
+        follow_hit = None if more_live_hit else paddle_find_first(r"^\s*\+?\s*关注\s*$", rect_follow)
         if more_live_hit or follow_hit:
+            if click_top_right_close(
+                rect_close_btn,
+                "直播间关闭按钮",
+                symbol_pattern=r"^\s*[×✕✖xX]\s*$" if more_live_hit else None,
+                template="img_zhibojian-close01.png" if more_live_hit and HAS_LIVE_ROOM_TEMPLATE else None,
+            ):
+                time.sleep(1.5)
+                continue
             if more_live_hit:
-                log(f"  命中'更多直播' → 确认在直播间内，尝试点击关闭按钮...")
-            else:
-                log(f"  未命中'更多直播'，但左上角命中'关注' → 确认仍为直播间，尝试点击关闭按钮...")
-            close_clicked = False
-            
-            # 优先：使用 FindImages 匹配关闭按钮模板图（如果模板存在）
-            if HAS_LIVE_ROOM_TEMPLATE:
-                try:
-                    template_path = R.img("img_zhibojian-close01.png")
-                    result = FindImages.find(template_path, rect=rect_close_btn)
-                    if result:
-                        cx = result.get("center_x", 0)
-                        cy = result.get("center_y", 0)
-                        conf = result.get("confidence", 0)
-                        log(f"  FindImages 匹配到img_zhibojian-close01关闭按钮 (置信度={conf:.2f}) @ ({cx},{cy}) → 点击")
-                        safe_click(cx, cy, f"直播间关闭按钮(模板匹配,置信度={conf:.2f})")
-                        time.sleep(1.5)
-                        log(f"  已点击关闭按钮（模板匹配），继续等待'领取成功'出现...")
-                        close_clicked = True
-                except Exception as e:
-                    log(f"  FindImages 匹配异常: {e}，改用 OCR 方案")
-            
-            # 兜底：使用 OCR 在关闭按钮区域识别 × 符号
-            if not close_clicked:
-                log(f"  使用 OCR 兜底识别关闭按钮...")
-                close_hit = paddle_find_first(r"[×✕✖]", rect_close_btn, "关闭按钮OCR")
-                if close_hit:
-                    cx = close_hit.get("center_x", 0)
-                    cy = close_hit.get("center_y", 0)
-                    log(f"  OCR 命中关闭符号 @ ({cx},{cy}) → 点击")
-                    safe_click(cx, cy, "关闭按钮(OCR)")
-                    time.sleep(1.5)
-                    log(f"  已点击关闭按钮（OCR），继续等待'领取成功'出现...")
-                    close_clicked = True
+                log("  直播间关闭按钮未确认，等待页面更新")
+                time.sleep(0.8)
+                continue
 
-            # 最终兜底：部分直播间背景干扰图色/OCR，用控件搜索 label="关闭" 的按钮
-            # （iOS Selector 无 mode 参数；仅在前面两层都失败时才走，避免频繁 WDA dump）
-            if not close_clicked:
-                try:
-                    log(f"  使用 Selector 控件搜索兜底（label='关闭'）...")
-                    node = Selector().label("关闭").find()
-                    if node:
-                        # 关闭按钮坐标固定（用户实测 [1206,194,1253,239]），直接点击中心点，无需 frame 计算
-                        cx = (1206 + 1253) // 2
-                        cy = (194 + 239) // 2
-                        log(f"  Selector 命中'关闭'控件 → 点击固定坐标 ({cx},{cy})")
-                        safe_click(cx, cy, "关闭按钮(Selector,固定坐标)")
-                        time.sleep(1.5)
-                        log(f"  已点击关闭按钮（Selector），继续等待'领取成功'出现...")
-                        close_clicked = True
-                    else:
-                        log(f"  Selector 未找到 label='关闭' 的控件")
-                except Exception as e:
-                    log(f"  Selector 控件搜索异常: {e}")
-
-            if close_clicked:
-                continue  # 关闭后继续循环，等待领取成功出现
-            else:
-                log(f"  未找到关闭按钮，本轮跳过")
-
-        # ========== 3) 最低优先：倒计时文案 → 仅打印日志 ==========
+        # 倒计时文案仅打印日志。
         cd_hit = paddle_find_first(r"秒后可领奖励", rect_countdown, "倒计时")
         if cd_hit:
             text = cd_hit.get("text", "")
@@ -728,7 +787,6 @@ def claim_reward() -> int:
     # "领取奖励"弹窗按钮专属区（用户实测 [175,712,1108,1923]，超出绝不点）
     rect_reward_btn = [int(w * 0.13), int(h * 0.25), int(w * 0.87), int(h * 0.70)]
 
-    reward_pattern = r"^\s*领取奖励\s*$"
     hit_reward = find_open_reward_popup(rect_reward_btn)
     if not hit_reward:
         log("  等待右上角出现'领取成功'...")
@@ -736,7 +794,7 @@ def claim_reward() -> int:
         while time.time() < deadline:
             hit_claim = paddle_find_first(r"领取成功", rect_claim_top, "领取成功(右上角)")
             if hit_claim:
-                if not safe_click(hit_claim["center_x"], hit_claim["center_y"], "'领取成功'(右上角)"):
+                if not click_ad_header_text(hit_claim, "'领取成功'(右上角)"):
                     return 0
                 break
             time.sleep(0.35)
@@ -747,19 +805,19 @@ def claim_reward() -> int:
         log("  等待中间弹窗出现'领取奖励'按钮...")
         deadline = time.time() + 15
         while time.time() < deadline:
-            hit_reward = paddle_find_first(reward_pattern, rect_reward_btn, "领取奖励(弹窗)")
+            hit_reward = find_open_reward_popup(rect_reward_btn)
             if hit_reward:
                 break
             time.sleep(0.35)
         else:
-            log("  [失败] 15s 内未等到'领取奖励'弹窗")
+            log("  [失败] 15s 内未确认'领取奖励'弹窗")
             return 0
     cx2 = hit_reward["center_x"]
     cy2 = hit_reward["center_y"]
     if not safe_click(cx2, cy2, "'领取奖励'(弹窗)"):
         return 0
     time.sleep(1.5)
-    if paddle_find_first(reward_pattern, rect_reward_btn):
+    if find_open_reward_popup(rect_reward_btn):
         log("  [失败] 点击后领奖弹窗仍在")
         return 0
     log("  [成功] 领奖弹窗已关闭，继续检查下一轮广告")
@@ -790,6 +848,9 @@ def run_ad_loop() -> int:
 
         # 步骤 1：等广告倒计时结束（30s 超时）
         got_ad = wait_ad_countdown(timeout=30)
+        if got_ad is None:
+            idle_count = 0
+            continue
         if not got_ad:
             idle_count += 1
             log(f"  第 {round_idx} 轮：等超时，未检测到广告倒计时结束（连续 {idle_count}/{MAX_IDLE_ROUNDS} 轮无广告）")

@@ -134,7 +134,7 @@ run_project(...)
 | 中间「继续观看」 | 广告中途恢复（防误点底部下载） | x:7%~93%, y:25%~68%  |
 | 弹窗「领取奖励」 | 奖励按钮（仅限中间弹窗区）     | x:13%~87%, y:25%~70% |
 
-`CLICK_COORDINATES_ROTATED` 为当前 iPhone 的 AScript 点击通道开启坐标补偿。如果其他设备的点击位置与截图坐标一致，将它设为 `False`。
+`CLICK_COORDINATES_ROTATED` 默认为 `False`，使用原始屏幕坐标。仅在真机测得 AScript 将触点旋转 90° 时，将它设为 `True`。
 
 ## 注意事项
 

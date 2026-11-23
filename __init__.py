@@ -40,6 +40,9 @@ LOOP_INTERVAL = 3           # 每次主循环间隔（秒）
 # OCR 默认引擎（iOS 推荐 vision 或 paddle）
 OCR_ENGINE = "vision"       # "vision"(iOS16+原生) / "paddle" / "mlkit"
 
+# 这台 iPhone 的 AScript 点击通道会旋转触点，其他设备按实测关闭补偿。
+CLICK_COORDINATES_ROTATED = True
+
 # 区域配置（基于屏幕百分比，适配不同分辨率）
 # 右上角"免"字按钮区域：屏幕右上 1/4
 REGION_TOP_RIGHT = None     # 运行时根据屏幕尺寸动态计算
@@ -57,14 +60,24 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
+def tap_screen(x: int, y: int):
+    """把截图中的目标位置转换成当前点击通道的输入坐标。"""
+    if CLICK_COORDINATES_ROTATED:
+        _, height = screen_size() or (0, 0)
+        if height <= 0:
+            raise RuntimeError("无法读取屏幕高度，不能校正点击坐标")
+        # 真机测得触点为 (输入 y, 屏幕高度 - 输入 x)，这里做逆变换。
+        x, y = height - y, x
+    action.click(x, y)
+
+
 def safe_click(x: int, y: int, desc: str = ""):
     """
     安全点击：带日志 + 异常捕获
-    说明：如果后续切换 HID 通道，只需修改此函数内部实现
     """
     try:
         log(f"点击 [{desc}] -> ({x}, {y})")
-        action.click(x, y)
+        tap_screen(x, y)
         time.sleep(0.8)  # 点击后等待界面响应
         return True
     except Exception as e:
@@ -187,7 +200,7 @@ def skip_splash_ad(timeout=5) -> bool:
                         text = item.get("text", "")
                         conf = item.get("confidence", 0)
                         log(f"  [扫描#{scan_count} paddleocr 命中] '{text}' 置信度={conf:.2f} ({cx},{cy})")
-                        action.click(cx, cy)
+                        tap_screen(cx, cy)
                         time.sleep(0.2)
                         return True
         except Exception as e:
@@ -275,8 +288,7 @@ def paddle_find_first(pattern, rect, log_label=""):
 
 # 【弹窗内优先点击的按钮】出现这些按钮时，不要打叉关闭，而是优先点击它们
 #   - 领取奖励 / 领取成功 是用户明确要求点的
-#   - 注意："继续观看"不在这里！它有"中间区(恢复广告)"和"底部(下载诱导)"两种，
-#           必须由 check_and_click_continue_watching 在中间区单独识别，避免误点底部下载按钮
+#   - "继续观看"由 check_and_click_continue_watching 在广告顶部和中间弹窗单独识别。
 PRIORITY_CLICK_KEYWORDS = ["领取奖励", "领取成功", "立即领取", "确认领取"]
 
 
@@ -300,7 +312,7 @@ def close_membership_popup() -> bool:
             log(f"  [续费会员弹窗] 检测到底部 '{item.get('text','')}'，点击弹窗外部关闭")
             # 点击弹窗上方遮罩区域（y:30% 处，弹窗在 y:87% 以下）
             try:
-                action.click(int(w * 0.5), int(h * 0.30))
+                tap_screen(int(w * 0.5), int(h * 0.30))
             except Exception as e:
                 log(f"  点击关闭异常: {e}")
             time.sleep(1.2)
@@ -528,29 +540,32 @@ COUNTDOWN_KEYWORDS = [
    ]
 
 
-def check_and_click_continue_watching() -> bool:
-    """
-    检测并点击"继续观看"按钮——【仅限屏幕中间显眼位置】。
-
-    重要区分（两种"继续观看"绝不能混）：
-      - 中间显眼区（y:25%~68%）：广告中途误点关闭后弹出的恢复对话框 → 该点，继续看广告
-      - 屏幕底部：广告商诱导下载应用按钮（如"继续观看下载红果短剧"）→ 绝不点，会跳下载页
-
-    所以只在中间区域检测，绝不在底部/全屏检测。
-    返回 True 表示已点击中间的"继续观看"。
-    """
-    from ascript.ios.system import screen_size as _ss  # type: ignore
-    w, h = _ss() or (1080, 1920)
-    # 中间显眼区域（用户实测 [96,706,1184,1889] @ 1284x2778，
-    # 约为 x:7.5%~92%, y:25.4%~68%，按屏幕比例动态计算）
-    rect_continue = [int(w * 0.07), int(h * 0.25), int(w * 0.93), int(h * 0.68)]
-    item = paddle_find_first(r"继续观看", rect_continue, "继续观看(中间区)")
+def check_and_click_continue_watching(rect_top, rect_mid) -> bool:
+    """点击广告右上角或中间恢复弹窗中的「继续观看」。"""
+    mid_label = "继续观看(中间区)"
+    item = paddle_find_first(r"^\s*继续观看\s*$", rect_mid, mid_label)
     if item:
-        ok = safe_click(item["center_x"], item["center_y"], "继续观看(中间区)")
-        if ok:
-            time.sleep(2.5)
-            return True
-    return False
+        return safe_click(item["center_x"], item["center_y"], mid_label)
+
+    top_label = "继续观看(右上角)"
+    item = paddle_find_first(r"^\s*继续观看\s*[×✕✖xX]?\s*$", rect_top, top_label)
+    if not item:
+        return False
+
+    x = item["center_x"]
+    # 关闭符号与文字合并识别时，把点击位置移回文字。
+    if item["text"].strip() != "继续观看" and item.get("rect"):
+        left, _, right, _ = item["rect"]
+        x = left + (right - left) * 0.37
+    return safe_click(round(x), round(item["center_y"]), top_label)
+
+
+def find_open_reward_popup(rect):
+    """识别已经弹出的奖励对话框，并返回其中的领取按钮。"""
+    button = paddle_find_first(r"^\s*领取奖励\s*$", rect)
+    if button and paddle_find_first(r"^\s*坚持退出\s*$", rect):
+        return button
+    return None
 
 
 def wait_ad_countdown(timeout=30) -> bool:
@@ -560,7 +575,7 @@ def wait_ad_countdown(timeout=30) -> bool:
       1) 视频广告：倒计时结束 → 右上角出现"领取成功" → 返回，交给 claim_reward 处理
       2) 直播间广告：无倒计时，直接进入直播间 → 右上角显示"更多直播" → 
          点击关闭按钮(×) → 关闭后右上角出现"领取成功" → 返回
-    轮询优先级：领取成功 > 更多直播(直播间需关闭) > 秒后可领奖励(仅打印日志)
+    轮询优先级：已打开的领奖弹窗 > 领取成功 > 关闭直播间 > 广告倒计时 > 恢复观看
     """
     log("阶段四：等待广告倒计时结束（支持视频广告 & 直播间广告）")
     from ascript.ios.system import screen_size as _ss  # type: ignore
@@ -569,6 +584,8 @@ def wait_ad_countdown(timeout=30) -> bool:
     rect_claim_top = [int(w * 0.55), int(h * 0.03), w, int(h * 0.14)]
     # 右上角倒计时文案区域（仅打印日志）
     rect_countdown = [int(w * 0.58), int(h * 0.045), int(w * 0.97), int(h * 0.09)]
+    rect_continue_mid = [int(w * 0.07), int(h * 0.25), int(w * 0.93), int(h * 0.68)]
+    rect_reward_btn = [int(w * 0.13), int(h * 0.25), int(w * 0.87), int(h * 0.70)]
     # 直播间底部区域（检测是否为直播间广告）
     # 用户实测 [118,1691,1170,2183] @ 1284x2778 → x:9.2%~91.1%, y:60.9%~78.6%
     rect_live_room = [int(w * 0.092), int(h * 0.609), int(w * 0.911), int(h * 0.786)]
@@ -589,6 +606,10 @@ def wait_ad_countdown(timeout=30) -> bool:
 
     while time.time() < deadline:
         checks += 1
+
+        if find_open_reward_popup(rect_reward_btn):
+            log("  领奖弹窗已打开 → 直接领取奖励")
+            return True
 
         # ========== 1) 最高优先：检测"领取成功"是否出现 ==========
         # （视频广告倒计时结束，或 直播间关闭后 都会出现）
@@ -686,6 +707,8 @@ def wait_ad_countdown(timeout=30) -> bool:
             if sec is not None and sec != last_sec:
                 log(f"  广告倒计时中... {text}")
                 last_sec = sec
+        elif check_and_click_continue_watching(rect_claim_top, rect_continue_mid):
+            continue
 
         time.sleep(0.8)
 
@@ -696,20 +719,8 @@ def wait_ad_countdown(timeout=30) -> bool:
 # ============== 阶段五：领取奖励 ==============
 
 def claim_reward() -> int:
-    """
-    领取奖励流程（确定性两步走，用户已捋清，无多余分支）：
-
-    确定业务链：
-      倒计时结束 → 右上角出现"领取成功" → 点击它
-        → **肯定会**弹出中间对话框包含"领取奖励"按钮
-          → 点击"领取奖励" → **肯定会**进入新一轮广告（下一轮 wait_ad_countdown）
-
-    所以完全不需要其他判断（继续观看、第三方下载页、立即领取…都不处理）。
-    失败唯一情况：超时没找到"领取成功"或"领取奖励"。
-
-    返回值：1=两步都成功，已进入下一轮广告；0=超时失败
-    """
-    log("阶段五：领取奖励（确定两步：点领取成功 → 点领取奖励 → 进入下一轮广告）")
+    """处理已打开的领奖弹窗，或先点右上角「领取成功」再领取。"""
+    log("阶段五：领取奖励")
     from ascript.ios.system import screen_size as _ss  # type: ignore
     w, h = _ss() or (1080, 1920)
     # 右上角"领取成功"专属区（倒计时结束标志）
@@ -717,47 +728,41 @@ def claim_reward() -> int:
     # "领取奖励"弹窗按钮专属区（用户实测 [175,712,1108,1923]，超出绝不点）
     rect_reward_btn = [int(w * 0.13), int(h * 0.25), int(w * 0.87), int(h * 0.70)]
 
-    # ========== 第一步：等并点右上角"领取成功" ==========
-    log("  [步骤 1/2] 等待右上角出现'领取成功'...")
-    hit_claim = None
-    deadline1 = time.time() + 20  # 倒计时刚结束，领取成功按钮应该很快出现，20s 足够
-    checks1 = 0
-    while time.time() < deadline1:
-        checks1 += 1
-        hit_claim = paddle_find_first(r"领取成功", rect_claim_top, "领取成功(右上角)")
-        if hit_claim:
-            break
-        time.sleep(0.35)
-    if not hit_claim:
-        log(f"  [失败] 20s 内未等到右上角'领取成功'（轮询 {checks1} 次），本轮放弃")
-        return 0
-    cx1 = hit_claim["center_x"]
-    cy1 = hit_claim["center_y"]
-    log(f"  [命中] '领取成功' @ ({cx1:.1f},{cy1:.1f}) 置信度={hit_claim.get('confidence',0):.2f} → 点击")
-    safe_click(cx1, cy1, "'领取成功'(右上角)")
-
-    # ========== 第二步：点完"领取成功"，肯定会弹"领取奖励"对话框，等它出现并点击 ==========
-    log("  [步骤 2/2] 等待中间弹窗出现'领取奖励'按钮...")
-    time.sleep(0.6)  # 弹窗动画留一点时间（不要上来就找，大概率第一帧还没画出来）
-    hit_reward = None
-    deadline2 = time.time() + 15  # 点击后弹窗 15s 内肯定出来
-    checks2 = 0
-    while time.time() < deadline2:
-        checks2 += 1
-        hit_reward = paddle_find_first(r"领取奖励", rect_reward_btn, "领取奖励(弹窗)")
-        if hit_reward:
-            break
-        time.sleep(0.35)
+    reward_pattern = r"^\s*领取奖励\s*$"
+    hit_reward = find_open_reward_popup(rect_reward_btn)
     if not hit_reward:
-        log(f"  [失败] 点击'领取成功'后 15s 内未等到'领取奖励'弹窗（轮询 {checks2} 次），本轮放弃")
-        return 0
+        log("  等待右上角出现'领取成功'...")
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            hit_claim = paddle_find_first(r"领取成功", rect_claim_top, "领取成功(右上角)")
+            if hit_claim:
+                if not safe_click(hit_claim["center_x"], hit_claim["center_y"], "'领取成功'(右上角)"):
+                    return 0
+                break
+            time.sleep(0.35)
+        else:
+            log("  [失败] 20s 内未等到右上角'领取成功'")
+            return 0
+
+        log("  等待中间弹窗出现'领取奖励'按钮...")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            hit_reward = paddle_find_first(reward_pattern, rect_reward_btn, "领取奖励(弹窗)")
+            if hit_reward:
+                break
+            time.sleep(0.35)
+        else:
+            log("  [失败] 15s 内未等到'领取奖励'弹窗")
+            return 0
     cx2 = hit_reward["center_x"]
     cy2 = hit_reward["center_y"]
-    log(f"  [命中] '领取奖励' @ ({cx2:.1f},{cy2:.1f}) 置信度={hit_reward.get('confidence',0):.2f} → 点击（进入下一轮广告）")
-    safe_click(cx2, cy2, "'领取奖励'(弹窗)")
-    time.sleep(1.5)  # 给 App 跳转新广告一点时间，下一轮 wait_ad_countdown 接着等
-
-    log("  [成功] 两步领取完成，自动进入下一轮广告倒计时")
+    if not safe_click(cx2, cy2, "'领取奖励'(弹窗)"):
+        return 0
+    time.sleep(1.5)
+    if paddle_find_first(reward_pattern, rect_reward_btn):
+        log("  [失败] 点击后领奖弹窗仍在")
+        return 0
+    log("  [成功] 领奖弹窗已关闭，继续检查下一轮广告")
     return 1
 
 
